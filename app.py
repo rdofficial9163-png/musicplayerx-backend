@@ -14,7 +14,11 @@ import yt_dlp
 
 app = Flask(__name__)
 
-BGUTIL_SERVER_HOME = os.path.expanduser('~/bgutil-ytdlp-pot-provider/server')
+# build.sh clones bgutil into $PWD/bgutil-ytdlp-pot-provider/server
+# On Render, PWD during build = /opt/render/project/src (the repo root)
+# At runtime, the working dir is also the repo root, so this resolves correctly.
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+BGUTIL_SERVER_HOME = os.path.join(_REPO_ROOT, 'bgutil-ytdlp-pot-provider', 'server')
 
 # mweb + bgutil POT -- primary path
 YDL_OPTS_MWEB = {
@@ -26,7 +30,6 @@ YDL_OPTS_MWEB = {
     'extractor_args': {
         'youtube': {
             'player_client': ['mweb'],
-            # Allow formats even if POT wasn't attached (bgutil handles it)
             'formats': ['missing_pot'],
         },
         'youtubepot-bgutilscript': {
@@ -59,35 +62,25 @@ def is_bot_error(msg):
 def pick_url(info):
     """
     Extract the best playable URL from yt-dlp's info dict.
-
-    yt-dlp with skip_download=True does NOT always set a top-level 'url'.
-    The selected format(s) live in info['requested_formats'] (list, when
-    video+audio were merged) or info['url'] (single format).  We prefer
-    the audio stream from requested_formats, then fall back to the
-    top-level url, then scan all formats for an audio-only stream.
+    skip_download=True does NOT always set a top-level 'url'.
     """
-    # Case 1: single selected format with direct url
     if info.get('url'):
         return info['url']
 
-    # Case 2: multiple selected formats (e.g. video+audio merge attempt)
     requested = info.get('requested_formats') or []
     for fmt in requested:
         if fmt.get('url') and fmt.get('vcodec') == 'none':
-            return fmt['url']   # audio-only format
+            return fmt['url']
     for fmt in requested:
         if fmt.get('url'):
-            return fmt['url']   # any format
+            return fmt['url']
 
-    # Case 3: scan full format list for best audio-only with a url
     formats = info.get('formats') or []
     audio_fmts = [f for f in formats if f.get('url') and f.get('vcodec') == 'none']
     if audio_fmts:
-        # highest abr wins
         audio_fmts.sort(key=lambda f: f.get('abr') or 0, reverse=True)
         return audio_fmts[0]['url']
 
-    # Case 4: any format with a url at all
     for fmt in formats:
         if fmt.get('url'):
             return fmt['url']
@@ -100,7 +93,7 @@ def try_extract(video_url, opts):
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
             if not info:
-                return None, 'no info returned'
+                return None, None, 'no info returned'
             url = pick_url(info)
             if url:
                 return info, url, None
@@ -121,14 +114,12 @@ def stream():
 
     video_url = 'https://www.youtube.com/watch?v=' + video_id
 
-    # Try mweb + POT first
     info, url, err = try_extract(video_url, YDL_OPTS_MWEB)
 
-    # Fall back to tv_embedded/ios if mweb failed
     if not info or not url:
         info, url, err2 = try_extract(video_url, YDL_OPTS_FALLBACK)
         if err2:
-            err = err2  # surface the most recent error
+            err = err2
 
     if not info or not url:
         if is_bot_error(err or ''):
@@ -150,9 +141,11 @@ def stream():
 
 @app.route('/health')
 def health():
+    bgutil_ok = os.path.isdir(BGUTIL_SERVER_HOME)
     return jsonify({
         'status': 'ok',
-        'bgutil_built': os.path.isdir(BGUTIL_SERVER_HOME),
+        'bgutil_built': bgutil_ok,
+        'bgutil_path': BGUTIL_SERVER_HOME,   # shows exact path being checked
     })
 
 
