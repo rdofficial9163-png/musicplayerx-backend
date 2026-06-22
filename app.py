@@ -2,16 +2,10 @@
 Render.com backend for Music PlayerX's Online tab.
 
 Uses yt-dlp + bgutil-ytdlp-pot-provider (script mode) to generate
-real YouTube BotGuard PO Tokens per-request, bypassing the
-"Sign in to confirm you're not a bot" block that hits plain server IPs.
+real YouTube BotGuard PO Tokens, bypassing bot-check on server IPs.
 
-build.sh clones bgutil and compiles it during Render's build step.
-At runtime, yt-dlp's bgutil plugin spawns Node.js to fetch the token.
-
-Endpoint:
-    GET /stream?id=<11-char videoId>
-    200 -> {"url": "...", "title": "...", "duration": 123}
-    502 -> {"error": "..."}
+mweb client provides HLS streams -- format selector must not restrict
+to m4a/webm since mweb only has m3u8. ExoPlayer handles HLS fine.
 """
 
 import os
@@ -20,38 +14,30 @@ import yt_dlp
 
 app = Flask(__name__)
 
-# Path where build.sh put the compiled bgutil server
 BGUTIL_SERVER_HOME = os.path.expanduser('~/bgutil-ytdlp-pot-provider/server')
 
-YDL_OPTS = {
-    'format': 'bestaudio[ext=m4a]/bestaudio/best',
+# mweb + bgutil POT -- primary path
+YDL_OPTS_MWEB = {
+    'format': 'bestaudio/best',
     'quiet': True,
     'no_warnings': True,
     'noplaylist': True,
     'skip_download': True,
-    # mweb client is what yt-dlp officially recommends with PO Token
     'extractor_args': {
         'youtube': {
             'player_client': ['mweb'],
+            # Allow formats even if POT wasn't attached (bgutil handles it)
+            'formats': ['missing_pot'],
         },
-        # Tell bgutil plugin where the compiled server script lives
         'youtubepot-bgutilscript': {
             'server_home': [BGUTIL_SERVER_HOME],
         },
     },
-    'http_headers': {
-        'User-Agent': (
-            'Mozilla/5.0 (Linux; Android 12; Pixel 6) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) '
-            'Chrome/120.0.0.0 Mobile Safari/537.36'
-        ),
-        'Accept-Language': 'en-US,en;q=0.9',
-    },
 }
 
-# Fallback opts used if mweb+POT still fails (e.g. bgutil Node spawn issue)
+# Fallback: tv_embedded then ios -- no POT needed, may still work
 YDL_OPTS_FALLBACK = {
-    'format': 'bestaudio[ext=m4a]/bestaudio/best',
+    'format': 'bestaudio/best',
     'quiet': True,
     'no_warnings': True,
     'noplaylist': True,
@@ -63,18 +49,24 @@ YDL_OPTS_FALLBACK = {
     },
 }
 
-BOT_PHRASES = ('sign in to confirm', 'bot', 'please sign in')
+BOT_PHRASES = ('sign in to confirm', 'not a bot', 'please sign in')
 
 
 def is_bot_error(msg):
-    low = msg.lower()
-    return any(p in low for p in BOT_PHRASES)
+    return any(p in msg.lower() for p in BOT_PHRASES)
 
 
-def extract(video_url, opts):
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
-        return info
+def try_extract(video_url, opts):
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            if info and info.get('url'):
+                return info, None
+            return None, 'no playable url returned'
+    except yt_dlp.utils.DownloadError as e:
+        return None, str(e)
+    except Exception as e:
+        return None, str(e)
 
 
 @app.route('/stream')
@@ -86,36 +78,26 @@ def stream():
         return jsonify({'error': 'invalid video id'}), 400
 
     video_url = 'https://www.youtube.com/watch?v=' + video_id
-    info = None
-    last_err = 'Extraction failed'
 
-    # Try mweb + bgutil PO Token first
-    try:
-        info = extract(video_url, YDL_OPTS)
-    except yt_dlp.utils.DownloadError as e:
-        last_err = str(e)
-    except Exception as e:
-        last_err = str(e)
+    # Try mweb + POT first
+    info, err = try_extract(video_url, YDL_OPTS_MWEB)
 
-    # If that failed, try fallback clients
-    if info is None or not info.get('url'):
-        try:
-            info = extract(video_url, YDL_OPTS_FALLBACK)
-        except yt_dlp.utils.DownloadError as e:
-            last_err = str(e)
-        except Exception as e:
-            last_err = str(e)
+    # Fall back to tv_embedded/ios if mweb failed
+    if not info:
+        info, err2 = try_extract(video_url, YDL_OPTS_FALLBACK)
+        if err2:
+            err = err2  # surface the most recent error
 
-    if not info or not info.get('url'):
-        if is_bot_error(last_err):
+    if not info:
+        if is_bot_error(err or ''):
             return jsonify({'error': 'YouTube is blocking this server. Try again in a few minutes.'}), 502
-        if 'Private video' in last_err:
+        if 'Private video' in (err or ''):
             return jsonify({'error': 'This video is private'}), 502
-        if 'Video unavailable' in last_err:
+        if 'Video unavailable' in (err or ''):
             return jsonify({'error': 'Video unavailable'}), 502
-        if 'age' in last_err.lower():
+        if 'age' in (err or '').lower():
             return jsonify({'error': 'Age-restricted video'}), 502
-        return jsonify({'error': last_err}), 502
+        return jsonify({'error': err or 'Extraction failed'}), 502
 
     return jsonify({
         'url': info.get('url'),
@@ -126,8 +108,10 @@ def stream():
 
 @app.route('/health')
 def health():
-    bgutil_ok = os.path.isdir(BGUTIL_SERVER_HOME)
-    return jsonify({'status': 'ok', 'bgutil_built': bgutil_ok})
+    return jsonify({
+        'status': 'ok',
+        'bgutil_built': os.path.isdir(BGUTIL_SERVER_HOME),
+    })
 
 
 if __name__ == '__main__':
