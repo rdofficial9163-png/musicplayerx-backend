@@ -1,72 +1,57 @@
 """
 Render.com backend for Music PlayerX's Online tab.
-
-Uses yt-dlp + bgutil-ytdlp-pot-provider (script mode) to generate
-real YouTube BotGuard PO Tokens, bypassing bot-check on server IPs.
-
-mweb client provides HLS streams -- format selector must not restrict
-to m4a/webm since mweb only has m3u8. ExoPlayer handles HLS fine.
 """
 
 import os
+import logging
 from flask import Flask, request, jsonify
 import yt_dlp
 
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
-# build.sh clones bgutil into $PWD/bgutil-ytdlp-pot-provider/server
-# On Render, PWD during build = /opt/render/project/src (the repo root)
-# At runtime, the working dir is also the repo root, so this resolves correctly.
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 BGUTIL_SERVER_HOME = os.path.join(_REPO_ROOT, 'bgutil-ytdlp-pot-provider', 'server')
 
-# mweb + bgutil POT -- primary path
-YDL_OPTS_MWEB = {
-    'format': 'bestaudio/best',
-    'quiet': True,
-    'no_warnings': True,
-    'noplaylist': True,
-    'skip_download': True,
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['mweb'],
-            'formats': ['missing_pot'],
-        },
-        'youtubepot-bgutilscript': {
+def make_opts(player_clients, use_bgutil=False):
+    youtube_args = {
+        'player_client': player_clients,
+        'formats': ['missing_pot'],
+    }
+    opts = {
+        'format': 'bestaudio/best',
+        'quiet': False,
+        'no_warnings': False,
+        'noplaylist': True,
+        'skip_download': True,
+        'extractor_args': {'youtube': youtube_args},
+    }
+    if use_bgutil:
+        opts['extractor_args']['youtubepot-bgutilscript'] = {
             'server_home': [BGUTIL_SERVER_HOME],
-        },
-    },
-}
+        }
+    return opts
 
-# Fallback: tv_embedded then ios -- no POT needed, may still work
-YDL_OPTS_FALLBACK = {
-    'format': 'bestaudio/best',
-    'quiet': True,
-    'no_warnings': True,
-    'noplaylist': True,
-    'skip_download': True,
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['tv_embedded', 'ios'],
-        },
-    },
-}
+# Try these clients in order, each independently
+STRATEGIES = [
+    ('mweb+bgutil',      make_opts(['mweb'],                  use_bgutil=True)),
+    ('tv_embedded',      make_opts(['tv_embedded'],            use_bgutil=False)),
+    ('ios',              make_opts(['ios'],                    use_bgutil=False)),
+    ('android',          make_opts(['android'],                use_bgutil=False)),
+    ('web+bgutil',       make_opts(['web'],                    use_bgutil=True)),
+    ('mweb_nopot',       make_opts(['mweb'],                   use_bgutil=False)),
+]
 
 BOT_PHRASES = ('sign in to confirm', 'not a bot', 'please sign in')
-
 
 def is_bot_error(msg):
     return any(p in msg.lower() for p in BOT_PHRASES)
 
-
 def pick_url(info):
-    """
-    Extract the best playable URL from yt-dlp's info dict.
-    skip_download=True does NOT always set a top-level 'url'.
-    """
     if info.get('url'):
         return info['url']
-
     requested = info.get('requested_formats') or []
     for fmt in requested:
         if fmt.get('url') and fmt.get('vcodec') == 'none':
@@ -74,35 +59,36 @@ def pick_url(info):
     for fmt in requested:
         if fmt.get('url'):
             return fmt['url']
-
     formats = info.get('formats') or []
     audio_fmts = [f for f in formats if f.get('url') and f.get('vcodec') == 'none']
     if audio_fmts:
         audio_fmts.sort(key=lambda f: f.get('abr') or 0, reverse=True)
         return audio_fmts[0]['url']
-
     for fmt in formats:
         if fmt.get('url'):
             return fmt['url']
-
     return None
 
-
-def try_extract(video_url, opts):
+def try_extract(label, video_url, opts):
+    logger.info(f'[{label}] trying extraction')
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(video_url, download=False)
             if not info:
+                logger.warning(f'[{label}] no info returned')
                 return None, None, 'no info returned'
             url = pick_url(info)
             if url:
+                logger.info(f'[{label}] SUCCESS, url starts with: {url[:60]}')
                 return info, url, None
-            return None, None, 'no playable url found in extracted info'
+            logger.warning(f'[{label}] info returned but no url found')
+            return None, None, 'no playable url in info'
     except yt_dlp.utils.DownloadError as e:
+        logger.warning(f'[{label}] DownloadError: {e}')
         return None, None, str(e)
     except Exception as e:
+        logger.warning(f'[{label}] Exception: {e}')
         return None, None, str(e)
-
 
 @app.route('/stream')
 def stream():
@@ -113,41 +99,36 @@ def stream():
         return jsonify({'error': 'invalid video id'}), 400
 
     video_url = 'https://www.youtube.com/watch?v=' + video_id
+    last_err = None
 
-    info, url, err = try_extract(video_url, YDL_OPTS_MWEB)
+    for label, opts in STRATEGIES:
+        info, url, err = try_extract(label, video_url, opts)
+        if info and url:
+            return jsonify({
+                'url': url,
+                'title': info.get('title'),
+                'duration': info.get('duration'),
+                'client': label,
+            })
+        last_err = err
 
-    if not info or not url:
-        info, url, err2 = try_extract(video_url, YDL_OPTS_FALLBACK)
-        if err2:
-            err = err2
-
-    if not info or not url:
-        if is_bot_error(err or ''):
-            return jsonify({'error': 'YouTube is blocking this server. Try again in a few minutes.'}), 502
-        if 'Private video' in (err or ''):
-            return jsonify({'error': 'This video is private'}), 502
-        if 'Video unavailable' in (err or ''):
-            return jsonify({'error': 'Video unavailable'}), 502
-        if 'age' in (err or '').lower():
-            return jsonify({'error': 'Age-restricted video'}), 502
-        return jsonify({'error': err or 'Extraction failed'}), 502
-
-    return jsonify({
-        'url': url,
-        'title': info.get('title'),
-        'duration': info.get('duration'),
-    })
-
+    if is_bot_error(last_err or ''):
+        return jsonify({'error': 'YouTube is blocking this server. Try again later.'}), 502
+    if 'Private video' in (last_err or ''):
+        return jsonify({'error': 'This video is private'}), 502
+    if 'Video unavailable' in (last_err or ''):
+        return jsonify({'error': 'Video unavailable'}), 502
+    if 'age' in (last_err or '').lower():
+        return jsonify({'error': 'Age-restricted video'}), 502
+    return jsonify({'error': last_err or 'All clients failed'}), 502
 
 @app.route('/health')
 def health():
-    bgutil_ok = os.path.isdir(BGUTIL_SERVER_HOME)
     return jsonify({
         'status': 'ok',
-        'bgutil_built': bgutil_ok,
-        'bgutil_path': BGUTIL_SERVER_HOME,   # shows exact path being checked
+        'bgutil_built': os.path.isdir(BGUTIL_SERVER_HOME),
+        'bgutil_path': BGUTIL_SERVER_HOME,
     })
-
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
